@@ -1,0 +1,913 @@
+<DOCTYPE html!>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>מחשבון מרחק דאייה</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom styles for the scrollable sections if content overflows */
+        .scrollable-section {
+            max-height: 300px; /* Or any desired max height */
+            overflow-y: auto;
+        }
+        /* Style for the calculate button animation */
+        .button-glow {
+            box-shadow: 0 0 10px rgba(0, 255, 0, 0.5); /* Initial glow */
+            animation: pulse-glow 2s infinite alternate;
+        }
+        @keyframes pulse-glow {
+            from {
+                box-shadow: 0 0 5px rgba(0, 255, 0, 0.5), 0 0 10px rgba(0, 255, 0, 0.4);
+            }
+            to {
+                box-shadow: 0 0 15px rgba(0, 255, 0, 0.8), 0 0 20px rgba(0, 255, 0, 0.6);
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 flex items-center justify-center min-h-screen p-4">
+    <div id="root" class="bg-white p-6 sm:p-8 rounded-lg shadow-xl w-full max-w-4xl"></div>
+
+    <!-- React and ReactDOM CDNs -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Compiled JavaScript code (no Babel needed here) -->
+    <script>
+        const useState = React.useState;
+        const useEffect = React.useEffect;
+
+        // Conversion constant: 1 Nautical Mile = 1.852 Kilometers
+        const NM_TO_KM = 1.852;
+        // Safety margin for landing altitude in feet
+        const SAFETY_MARGIN_FT = 500;
+        // A small epsilon for floating point comparisons to prevent infinite loops due to tiny remainders
+        const EPSILON = 1e-9;
+
+        // Helper function for linear interpolation
+        const linearInterpolate = (x, x0, y0, x1, y1) => {
+            if (x0 === x1) return y0;
+            if (x <= x0) return y0;
+            if (x >= x1) return y1;
+            return y0 + (x - x0) * (y1 - y0) / (x1 - x0);
+        };
+
+        // Helper function for interpolating angles (wind direction)
+        const interpolateAngle = (currentAltitudeKft, alt0Kft, angle0, alt1Kft, angle1) => {
+            if (alt0Kft === alt1Kft) return angle0;
+            if (currentAltitudeKft <= alt0Kft) return angle0;
+            if (currentAltitudeKft >= alt1Kft) return angle1;
+
+            let diff = angle1 - angle0;
+            if (diff > 180) diff -= 360;
+            if (diff < -180) diff += 360;
+
+            const interpolated = angle0 + diff * ((currentAltitudeKft - alt0Kft) / (alt1Kft - alt0Kft));
+            return (interpolated + 360) % 360;
+        };
+
+        // Helper function to convert degrees (aviation: 0=N, 90=E, clockwise) to radians for SVG (0=top, clockwise)
+        const toRadiansForSVG = (degrees) => {
+            return toRadians(degrees - 90);
+        };
+        const toRadians = (degrees) => degrees * Math.PI / 180;
+
+        // Helper function to simulate flight for a given speed and direction
+        const simulateFlight = (
+            testSpeed,
+            currentTestFlightDirection,
+            initialAltitude,
+            groundAltitude,
+            batteryTime,
+            sortedSpeedRoDPairs,
+            sortedWindLayers
+        ) => {
+            let simulationCurrentAltitude = initialAltitude;
+            let simulationTimeElapsed = 0;
+            let simulationDistanceNM = 0;
+
+            const effectiveGroundAltitude = groundAltitude + SAFETY_MARGIN_FT;
+
+            let interpolatedRoD;
+            let lowerRoD = sortedSpeedRoDPairs[0];
+            let upperRoD = sortedSpeedRoDPairs[sortedSpeedRoDPairs.length - 1];
+
+            if (testSpeed <= lowerRoD.speed) {
+                interpolatedRoD = lowerRoD.rod;
+            } else if (testSpeed >= upperRoD.speed) {
+                interpolatedRoD = upperRoD.rod;
+            } else {
+                for (let k = 0; k < sortedSpeedRoDPairs.length - 1; k++) {
+                    if (testSpeed >= sortedSpeedRoDPairs[k].speed && testSpeed <= sortedSpeedRoDPairs[k+1].speed) {
+                        lowerRoD = sortedSpeedRoDPairs[k];
+                        upperRoD = sortedSpeedRoDPairs[k+1];
+                        break;
+                    }
+                }
+                interpolatedRoD = linearInterpolate(testSpeed, lowerRoD.speed, lowerRoD.rod, upperRoD.speed, upperRoD.rod);
+            }
+
+            if (interpolatedRoD <= 0) {
+                return { distance: 0, time: 0 };
+            }
+
+            while (true) {
+                const timeToGround = (simulationCurrentAltitude - effectiveGroundAltitude) / interpolatedRoD;
+                const timeToBatteryLimit = batteryTime - simulationTimeElapsed;
+
+                let timeStep = Math.min(1, timeToGround, timeToBatteryLimit);
+                if (timeStep <= EPSILON) break;
+
+                const altitudeForWind = Math.max(effectiveGroundAltitude, simulationCurrentAltitude - (interpolatedRoD * timeStep / 2));
+                const altKftForWind = altitudeForWind / 1000;
+
+                let windSpeedAtAltitude = 0;
+                let windDirectionAtAltitude = 0;
+
+                if (sortedWindLayers.length === 1) {
+                    windSpeedAtAltitude = sortedWindLayers[0].speed;
+                    windDirectionAtAltitude = sortedWindLayers[0].direction;
+                } else {
+                    let lowerWind = sortedWindLayers[0];
+                    let upperWind = sortedWindLayers[sortedWindLayers.length - 1];
+
+                    if (altKftForWind <= lowerWind.altitudeKft) {
+                        windSpeedAtAltitude = lowerWind.speed;
+                        windDirectionAtAltitude = lowerWind.direction;
+                    } else if (altKftForWind >= upperWind.altitudeKft) {
+                        windSpeedAtAltitude = upperWind.speed;
+                        windDirectionAtAltitude = upperWind.direction;
+                    } else {
+                        for (let k = 0; k < sortedWindLayers.length - 1; k++) {
+                            if (altKftForWind >= sortedWindLayers[k].altitudeKft && altKftForWind <= sortedWindLayers[k+1].altitudeKft) {
+                                lowerWind = sortedWindLayers[k];
+                                upperWind = sortedWindLayers[k+1];
+                                break;
+                            }
+                        }
+                        windSpeedAtAltitude = linearInterpolate(altKftForWind, lowerWind.altitudeKft, lowerWind.speed, upperWind.altitudeKft, upperWind.speed);
+                        windDirectionAtAltitude = interpolateAngle(altKftForWind, lowerWind.altitudeKft, lowerWind.direction, upperWind.altitudeKft, upperWind.direction);
+                    }
+                }
+
+                const windGoesToDirection = (windDirectionAtAltitude + 180) % 360;
+
+                const windAngleRad = toRadians((90 - windGoesToDirection + 360) % 360);
+                const flightAngleRad = toRadians((90 - currentTestFlightDirection + 360) % 360);
+
+                const airVx = testSpeed * Math.cos(flightAngleRad);
+                const airVy = testSpeed * Math.sin(flightAngleRad);
+
+                const windVx = windSpeedAtAltitude * Math.cos(windAngleRad);
+                const windVy = windSpeedAtAltitude * Math.sin(windAngleRad);
+
+                const groundVx = airVx + windVx;
+                const groundVy = airVy + windVy;
+
+                const groundSpeed = Math.sqrt(groundVx * groundVx + groundVy * groundVy);
+
+                simulationDistanceNM += groundSpeed * (timeStep / 60);
+
+                simulationCurrentAltitude -= interpolatedRoD * timeStep;
+                simulationTimeElapsed += timeStep;
+
+                if (simulationCurrentAltitude <= effectiveGroundAltitude || simulationTimeElapsed >= batteryTime) {
+                    break;
+                }
+            }
+            return { distance: simulationDistanceNM, time: simulationTimeElapsed };
+        };
+
+        const App = () => {
+            const [initialAltitude, setInitialAltitude] = useState(10000);
+            const [groundAltitude, setGroundAltitude] = useState(0);
+            const [batteryTime, setBatteryTime] = useState(20);
+            const [desiredFlightDirection, setDesiredFlightDirection] = useState(0);
+            const [speedRoDPairs, setSpeedRoDPairs] = useState([
+                { speed: 52, rod: 400 },
+                { speed: 75, rod: 1200 }
+            ]);
+            const [windLayers, setWindLayers] = useState([
+                { altitudeKft: 0, speed: 5, direction: 90 },
+                { altitudeKft: 5, speed: 10, direction: 120 },
+                { altitudeKft: 10, speed: 15, direction: 150 }
+            ]);
+
+            const [polarResults, setPolarResults] = useState([]);
+            const [specificDirectionResult, setSpecificDirectionResult] = useState(null);
+            const [isLoading, setIsLoading] = useState(false);
+            const [error, setError] = useState('');
+
+            useEffect(() => {
+                calculateGlideDistance();
+            }, []);
+
+            const addSpeedRoDPair = () => {
+                setSpeedRoDPairs([...speedRoDPairs, { speed: 0, rod: 0 }]);
+            };
+
+            const updateSpeedRoDPair = (index, field, value) => {
+                const newPairs = [...speedRoDPairs];
+                newPairs[index][field] = parseFloat(value) || 0; // Ensure number, default to 0
+                setSpeedRoDPairs(newPairs);
+            };
+
+            const removeSpeedRoDPair = (index) => {
+                const newPairs = speedRoDPairs.filter((_, i) => i !== index);
+                setSpeedRoDPairs(newPairs);
+            };
+
+            const addWindLayer = () => {
+                setWindLayers([...windLayers, { altitudeKft: 0, speed: 0, direction: 0 }]);
+            };
+
+            const updateWindLayer = (index, field, value) => {
+                const newLayers = [...windLayers];
+                newLayers[index][field] = parseFloat(value) || 0; // Ensure number, default to 0
+                if (field === 'direction') {
+                    newLayers[index][field] = (parseFloat(value) || 0) % 360; // Keep direction within 0-359.99
+                    if (newLayers[index][field] < 0) newLayers[index][field] += 360;
+                }
+                setWindLayers(newLayers);
+            };
+
+            const removeWindLayer = (index) => {
+                const newLayers = windLayers.filter((_, i) => i !== index);
+                setWindLayers(newLayers);
+            };
+
+            const calculateGlideDistance = () => {
+                setError('');
+                setIsLoading(true);
+
+                try {
+                    if (initialAltitude <= (groundAltitude + SAFETY_MARGIN_FT)) {
+                        throw new Error(`Initial altitude (${initialAltitude} ft) must be greater than ground altitude plus the safety margin (${groundAltitude + SAFETY_MARGIN_FT} ft).`);
+                    }
+                    if (speedRoDPairs.length < 2) {
+                        throw new Error('Please provide at least two Speed/Rate of Descent pairs for interpolation.');
+                    }
+                    if (windLayers.length < 1) {
+                        throw new Error('Please provide at least one Wind Layer.');
+                    }
+                    if (batteryTime <= 0) {
+                        throw new Error('Battery time must be positive.');
+                    }
+                    if (speedRoDPairs.some(p => isNaN(p.speed) || isNaN(p.rod) || p.speed < 0 || p.rod < 0)) {
+                        throw new Error('All speed and rate of descent values must be non-negative numbers.');
+                    }
+                    if (speedRoDPairs.some(p => p.rod === 0 && p.speed > 0)) {
+                         throw new Error('Rate of Descent cannot be zero for a non-zero speed. Please enter a positive value.');
+                    }
+                    if (windLayers.some(w => isNaN(w.altitudeKft) || isNaN(w.speed) || isNaN(w.direction) || w.altitudeKft < 0 || w.speed < 0 || w.direction < 0 || w.direction > 360)) {
+                        throw new Error('All wind layer values (altitude, speed, direction) must be valid numbers. Altitude and speed must be non-negative, direction between 0-360.');
+                    }
+                    const uniqueSpeeds = new Set(speedRoDPairs.map(p => p.speed));
+                    if (uniqueSpeeds.size !== speedRoDPairs.length) {
+                        throw new Error('Speed values in "Speed vs. Rate of Descent" pairs must be unique.');
+                    }
+                    const uniqueAltitudes = new Set(windLayers.map(w => w.altitudeKft));
+                    if (uniqueAltitudes.size !== windLayers.length) {
+                        throw new Error('Altitude values in "Wind Layers" must be unique.');
+                    }
+
+                    const sortedSpeedRoDPairs = [...speedRoDPairs].sort((a, b) => a.speed - b.speed);
+                    const sortedWindLayers = [...windLayers].sort((a, b) => a.altitudeKft - b.altitudeKft);
+
+                    const currentPolarResults = [];
+
+                    const minSpeed = sortedSpeedRoDPairs[0].speed;
+                    const maxSpeed = sortedSpeedRoDPairs[sortedSpeedRoDPairs.length - 1].speed;
+                    const speedIncrement = (maxSpeed - minSpeed) / 100;
+
+                    for (let currentTestFlightDirection = 0; currentTestFlightDirection < 360; currentTestFlightDirection += 30) {
+                        let bestDistanceForCurrentDirectionNM = 0;
+                        let optimalSpeedForCurrentDirection = null;
+                        let actualTimeForCurrentDirection = null;
+
+                        for (let i = 0; i <= 100; i++) {
+                            const testSpeed = minSpeed + i * speedIncrement;
+                            if (testSpeed <= 0 && minSpeed !== 0) continue; // Only skip if minSpeed is not 0, allowing for 0 speed
+                            if (testSpeed <= 0 && minSpeed === 0 && i === 0) { /* Allow 0 speed for first iteration if minSpeed is 0 */ }
+                            else if (testSpeed <= 0) continue; // Prevent negative speeds from interpolation
+
+
+                            const { distance: simulationDistanceNM, time: simulationTimeElapsed } = simulateFlight(
+                                testSpeed,
+                                currentTestFlightDirection,
+                                initialAltitude,
+                                groundAltitude,
+                                batteryTime,
+                                sortedSpeedRoDPairs,
+                                sortedWindLayers
+                            );
+
+                            if (simulationDistanceNM > bestDistanceForCurrentDirectionNM) {
+                                bestDistanceForCurrentDirectionNM = simulationDistanceNM;
+                                optimalSpeedForCurrentDirection = testSpeed;
+                                actualTimeForCurrentDirection = simulationTimeElapsed;
+                            }
+                        }
+
+                        if (optimalSpeedForCurrentDirection !== null) {
+                            currentPolarResults.push({
+                                direction: currentTestFlightDirection,
+                                distance: bestDistanceForCurrentDirectionNM * NM_TO_KM,
+                                speed: optimalSpeedForCurrentDirection,
+                                time: actualTimeForCurrentDirection
+                            });
+                        }
+                    }
+
+                    let bestDistanceForDesiredDirectionNM = 0;
+                    let optimalSpeedForDesiredDirection = null;
+                    let actualTimeForDesiredDirection = null;
+
+                    for (let i = 0; i <= 100; i++) {
+                        const testSpeed = minSpeed + i * speedIncrement;
+                        if (testSpeed <= 0 && minSpeed !== 0) continue;
+                        if (testSpeed <= 0 && minSpeed === 0 && i === 0) { /* Allow 0 speed for first iteration if minSpeed is 0 */ }
+                        else if (testSpeed <= 0) continue;
+
+                        const { distance: simulationDistanceNM, time: simulationTimeElapsed } = simulateFlight(
+                            testSpeed,
+                            desiredFlightDirection,
+                            initialAltitude,
+                            groundAltitude,
+                            batteryTime,
+                            sortedSpeedRoDPairs,
+                            sortedWindLayers
+                        );
+
+                        if (simulationDistanceNM > bestDistanceForDesiredDirectionNM) {
+                            bestDistanceForDesiredDirectionNM = simulationDistanceNM;
+                            optimalSpeedForDesiredDirection = testSpeed;
+                            actualTimeForDesiredDirection = simulationTimeElapsed;
+                        }
+                    }
+
+                    setSpecificDirectionResult({
+                        direction: desiredFlightDirection,
+                        distance: bestDistanceForDesiredDirectionNM * NM_TO_KM,
+                        speed: optimalSpeedForDesiredDirection,
+                        time: actualTimeForDesiredDirection
+                    });
+
+                    setPolarResults(currentPolarResults);
+                } catch (e) {
+                    setError(e.message);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const SpiderGraph = ({ data, desiredFlightDirection }) => {
+                if (!data || data.length === 0) {
+                    return (
+                        React.createElement("div", { className: "flex justify-center items-center mt-8 p-6 bg-gray-50 rounded-lg shadow-inner" },
+                            React.createElement("p", { className: "text-gray-600" }, "אין נתונים זמינים לגרף העכביש. אנא בצע חישוב קודם.")
+                        )
+                    );
+                }
+
+                const size = 380;
+                const padding = 50;
+                const radius = (size / 2) - padding;
+                const centerX = size / 2;
+                const centerY = size / 2;
+
+                const maxDistance = Math.max(...data.map(d => d.distance));
+                const scaleFactor = maxDistance > 0 ? radius / maxDistance : 0;
+
+                const numCircles = 5;
+                const circleInterval = radius / numCircles;
+
+                const azimuthDegrees = Array.from({ length: 12 }, (_, i) => i * 30);
+                const outerRadiusForLabels = radius + 25;
+
+                return (
+                    React.createElement("div", { className: "flex justify-center mt-8" },
+                        React.createElement("svg", { width: size, height: size, viewBox: `0 0 ${size} ${size}`, className: "bg-white rounded-lg shadow-md" },
+                            [...Array(numCircles).keys()].map(i => {
+                                const r = (i + 1) * circleInterval;
+                                return (
+                                    React.createElement("circle", {
+                                        key: `circle-${i}`,
+                                        cx: centerX,
+                                        cy: centerY,
+                                        r: r,
+                                        fill: "none",
+                                        stroke: "#e0e0e0",
+                                        strokeWidth: "1"
+                                    })
+                                );
+                            }),
+                            [...Array(numCircles).keys()].map(i => {
+                                const r = (i + 1) * circleInterval;
+                                const labelValue = ((i + 1) * maxDistance / numCircles).toFixed(0);
+                                return (
+                                    React.createElement("text", {
+                                        key: `circle-label-${i}`,
+                                        x: centerX + 5,
+                                        y: centerY - r - 5,
+                                        textAnchor: "start",
+                                        fontSize: "10",
+                                        fill: "#777"
+                                    }, labelValue, " km")
+                                );
+                            }),
+
+                            azimuthDegrees.map((angleDeg, index) => {
+                                const angleRad = toRadiansForSVG(angleDeg);
+                                const x2 = centerX + radius * Math.cos(angleRad);
+                                const y2 = centerY + radius * Math.sin(angleRad);
+                                return (
+                                    React.createElement("line", {
+                                        key: `axis-line-${index}`,
+                                        x1: centerX, y1: centerY, x2: x2, y2: y2,
+                                        stroke: "#e0e0e0",
+                                        strokeWidth: "1"
+                                    })
+                                );
+                            }),
+
+                            azimuthDegrees.map((azimuthDeg, index) => {
+                                const angleRad = toRadiansForSVG(azimuthDeg);
+                                const x = centerX + outerRadiusForLabels * Math.cos(angleRad);
+                                const y = centerY + outerRadiusForLabels * Math.sin(angleRad) + 5;
+                                return (
+                                    React.createElement("text", {
+                                        key: `azimuth-label-${index}`,
+                                        x: x,
+                                        y: y,
+                                        textAnchor: "middle",
+                                        fontSize: "12",
+                                        fill: "#555",
+                                        fontWeight: "bold"
+                                    }, azimuthDeg, "\u00b0")
+                                );
+                            }),
+
+                            React.createElement("polygon", {
+                                points: data.map(point => {
+                                    const angleRad = toRadiansForSVG(point.direction);
+                                    const r = point.distance * scaleFactor;
+                                    const x = centerX + r * Math.cos(angleRad);
+                                    const y = centerY + r * Math.sin(angleRad);
+                                    return `${x},${y}`;
+                                }).join(' '),
+                                fill: "rgba(79, 70, 229, 0.4)",
+                                stroke: "rgb(79, 70, 229)",
+                                strokeWidth: "2"
+                            }),
+
+                            data.map((point, index) => {
+                                const angleRad = toRadiansForSVG(point.direction);
+                                const r = point.distance * scaleFactor;
+                                const x = centerX + r * Math.cos(angleRad);
+                                const y = centerY + r * Math.sin(angleRad);
+
+                                return (
+                                    React.createElement("g", { key: `data-point-${index}` },
+                                        React.createElement("circle", {
+                                            cx: x,
+                                            cy: y,
+                                            r: "4",
+                                            fill: "rgb(79, 70, 229)",
+                                            stroke: "white",
+                                            strokeWidth: "1.5"
+                                        }),
+                                        React.createElement("text", {
+                                            x: x,
+                                            y: y - 8,
+                                            textAnchor: "middle",
+                                            fontSize: "10",
+                                            fill: "#333"
+                                        }, point.distance.toFixed(0), " km (", point.speed.toFixed(0), " kts)")
+                                    )
+                                );
+                            }),
+
+                            desiredFlightDirection !== undefined && desiredFlightDirection !== null && !isNaN(desiredFlightDirection) && (
+                                (() => {
+                                    const lineAngleRad = toRadiansForSVG(desiredFlightDirection);
+                                    const lineX = centerX + radius * Math.cos(lineAngleRad);
+                                    const lineY = centerY + radius * Math.sin(lineAngleRad);
+                                    return (
+                                        React.createElement("line", {
+                                            x1: centerX,
+                                            y1: centerY,
+                                            x2: lineX,
+                                            y2: lineY,
+                                            stroke: "rgb(220, 38, 38)",
+                                            strokeWidth: "3",
+                                            strokeDasharray: "5,5"
+                                        })
+                                    );
+                                })()
+                            )
+                        )
+                    )
+                );
+            };
+
+            const CalculatorApp = () => { // Renamed App to CalculatorApp to avoid potential conflicts in compilation
+                const [initialAltitude, setInitialAltitude] = useState(10000);
+                const [groundAltitude, setGroundAltitude] = useState(0);
+                const [batteryTime, setBatteryTime] = useState(20);
+                const [desiredFlightDirection, setDesiredFlightDirection] = useState(0);
+                const [speedRoDPairs, setSpeedRoDPairs] = useState([
+                    { speed: 52, rod: 400 },
+                    { speed: 75, rod: 1200 }
+                ]);
+                const [windLayers, setWindLayers] = useState([
+                    { altitudeKft: 0, speed: 5, direction: 90 },
+                    { altitudeKft: 5, speed: 10, direction: 120 },
+                    { altitudeKft: 10, speed: 15, direction: 150 }
+                ]);
+
+                const [polarResults, setPolarResults] = useState([]);
+                const [specificDirectionResult, setSpecificDirectionResult] = useState(null);
+                const [isLoading, setIsLoading] = useState(false);
+                const [error, setError] = useState('');
+
+                useEffect(() => {
+                    calculateGlideDistance();
+                }, []);
+
+                const addSpeedRoDPair = () => {
+                    setSpeedRoDPairs([...speedRoDPairs, { speed: 0, rod: 0 }]);
+                };
+
+                const updateSpeedRoDPair = (index, field, value) => {
+                    const newPairs = [...speedRoDPairs];
+                    newPairs[index][field] = parseFloat(value) || 0;
+                    setSpeedRoDPairs(newPairs);
+                };
+
+                const removeSpeedRoDPair = (index) => {
+                    const newPairs = speedRoDPairs.filter((_, i) => i !== index);
+                    setSpeedRoDPairs(newPairs);
+                };
+
+                const addWindLayer = () => {
+                    setWindLayers([...windLayers, { altitudeKft: 0, speed: 0, direction: 0 }]);
+                };
+
+                const updateWindLayer = (index, field, value) => {
+                    const newLayers = [...windLayers];
+                    newLayers[index][field] = parseFloat(value) || 0;
+                    if (field === 'direction') {
+                        newLayers[index][field] = (parseFloat(value) || 0) % 360;
+                        if (newLayers[index][field] < 0) newLayers[index][field] += 360;
+                    }
+                    setWindLayers(newLayers);
+                };
+
+                const removeWindLayer = (index) => {
+                    const newLayers = windLayers.filter((_, i) => i !== index);
+                    setWindLayers(newLayers);
+                };
+
+                const calculateGlideDistance = () => {
+                    setError('');
+                    setIsLoading(true);
+
+                    try {
+                        if (initialAltitude <= (groundAltitude + SAFETY_MARGIN_FT)) {
+                            throw new Error(`גובה התחלתי (${initialAltitude} רגל) חייב להיות גדול מגובה הקרקע בתוספת מרווח בטיחות (${groundAltitude + SAFETY_MARGIN_FT} רגל).`);
+                        }
+                        if (speedRoDPairs.length < 2) {
+                            throw new Error('אנא ספק לפחות שני זוגות מהירות/קצב ירידה עבור אינטרפולציה.');
+                        }
+                        if (windLayers.length < 1) {
+                            throw new Error('אנא ספק לפחות שכבת רוח אחת.');
+                        }
+                        if (batteryTime <= 0) {
+                            throw new Error('זמן הסוללה חייב להיות חיובי.');
+                        }
+                        if (speedRoDPairs.some(p => isNaN(p.speed) || isNaN(p.rod) || p.speed < 0 || p.rod < 0)) {
+                            throw new Error('כל ערכי המהירות וקצב הירידה חייבים להיות מספרים אי-שליליים.');
+                        }
+                        if (speedRoDPairs.some(p => p.rod === 0 && p.speed > 0)) {
+                             throw new Error('קצב ירידה לא יכול להיות אפס עבור מהירות לא אפסית. אנא הזן ערך חיובי.');
+                        }
+                        if (windLayers.some(w => isNaN(w.altitudeKft) || isNaN(w.speed) || isNaN(w.direction) || w.altitudeKft < 0 || w.speed < 0 || w.direction < 0 || w.direction > 360)) {
+                            throw new Error('כל ערכי שכבת הרוח (גובה, מהירות, כיוון) חייבים להיות מספרים חוקיים. גובה ומהירות חייבים להיות אי-שליליים, כיוון בין 0-360.');
+                        }
+                        const uniqueSpeeds = new Set(speedRoDPairs.map(p => p.speed));
+                        if (uniqueSpeeds.size !== speedRoDPairs.length) {
+                            throw new Error('ערכי המהירות בזוגות "מהירות מול קצב ירידה" חייבים להיות ייחודיים.');
+                        }
+                        const uniqueAltitudes = new Set(windLayers.map(w => w.altitudeKft));
+                        if (uniqueAltitudes.size !== windLayers.length) {
+                            throw new Error('ערכי הגובה ב"שכבות רוח" חייבים להיות ייחודיים.');
+                        }
+
+                        const sortedSpeedRoDPairs = [...speedRoDPairs].sort((a, b) => a.speed - b.speed);
+                        const sortedWindLayers = [...windLayers].sort((a, b) => a.altitudeKft - b.altitudeKft);
+
+                        const currentPolarResults = [];
+
+                        const minSpeed = sortedSpeedRoDPairs[0].speed;
+                        const maxSpeed = sortedSpeedRoDPairs[sortedSpeedRoDPairs.length - 1].speed;
+                        const speedIncrement = (maxSpeed - minSpeed) / 100;
+
+                        for (let currentTestFlightDirection = 0; currentTestFlightDirection < 360; currentTestFlightDirection += 30) {
+                            let bestDistanceForCurrentDirectionNM = 0;
+                            let optimalSpeedForCurrentDirection = null;
+                            let actualTimeForCurrentDirection = null;
+
+                            for (let i = 0; i <= 100; i++) {
+                                const testSpeed = minSpeed + i * speedIncrement;
+                                if (testSpeed <= 0 && minSpeed !== 0) continue;
+                                if (testSpeed <= 0 && minSpeed === 0 && i === 0) { }
+                                else if (testSpeed <= 0) continue;
+
+                                const { distance: simulationDistanceNM, time: simulationTimeElapsed } = simulateFlight(
+                                    testSpeed,
+                                    currentTestFlightDirection,
+                                    initialAltitude,
+                                    groundAltitude,
+                                    batteryTime,
+                                    sortedSpeedRoDPairs,
+                                    sortedWindLayers
+                                );
+
+                                if (simulationDistanceNM > bestDistanceForCurrentDirectionNM) {
+                                    bestDistanceForCurrentDirectionNM = simulationDistanceNM;
+                                    optimalSpeedForCurrentDirection = testSpeed;
+                                    actualTimeForCurrentDirection = simulationTimeElapsed;
+                                }
+                            }
+
+                            if (optimalSpeedForCurrentDirection !== null) {
+                                currentPolarResults.push({
+                                    direction: currentTestFlightDirection,
+                                    distance: bestDistanceForCurrentDirectionNM * NM_TO_KM,
+                                    speed: optimalSpeedForCurrentDirection,
+                                    time: actualTimeForCurrentDirection
+                                });
+                            }
+                        }
+
+                        let bestDistanceForDesiredDirectionNM = 0;
+                        let optimalSpeedForDesiredDirection = null;
+                        let actualTimeForDesiredDirection = null;
+
+                        for (let i = 0; i <= 100; i++) {
+                            const testSpeed = minSpeed + i * speedIncrement;
+                            if (testSpeed <= 0 && minSpeed !== 0) continue;
+                            if (testSpeed <= 0 && minSpeed === 0 && i === 0) { }
+                            else if (testSpeed <= 0) continue;
+
+                            const { distance: simulationDistanceNM, time: simulationTimeElapsed } = simulateFlight(
+                                testSpeed,
+                                desiredFlightDirection,
+                                initialAltitude,
+                                groundAltitude,
+                                batteryTime,
+                                sortedSpeedRoDPairs,
+                                sortedWindLayers
+                            );
+
+                            if (simulationDistanceNM > bestDistanceForDesiredDirectionNM) {
+                                bestDistanceForDesiredDirectionNM = simulationDistanceNM;
+                                optimalSpeedForDesiredDirection = testSpeed;
+                                actualTimeForDesiredDirection = simulationTimeElapsed;
+                            }
+                        }
+
+                        setSpecificDirectionResult({
+                            direction: desiredFlightDirection,
+                            distance: bestDistanceForDesiredDirectionNM * NM_TO_KM,
+                            speed: optimalSpeedForDesiredDirection,
+                            time: actualTimeForDesiredDirection
+                        });
+
+                        setPolarResults(currentPolarResults);
+                    } catch (e) {
+                        setError(e.message);
+                    } finally {
+                        setIsLoading(false);
+                    }
+                };
+
+                return (
+                    React.createElement("div", { className: "min-h-screen bg-gray-100 p-4 sm:p-6 lg:p-8 flex items-center justify-center font-sans" },
+                        React.createElement("div", { className: "bg-white p-6 sm:p-8 rounded-lg shadow-xl w-full max-w-4xl" },
+                            React.createElement("h1", { className: "text-3xl sm:text-4xl font-bold text-center text-gray-800 mb-6" }, "מחשבון מרחק דאייה"),
+
+                            error && (
+                                React.createElement("div", { className: "bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4", role: "alert" },
+                                    React.createElement("strong", { className: "font-bold" }, "שגיאה:"),
+                                    React.createElement("span", { className: "block sm:inline ml-2" }, error)
+                                )
+                            ),
+
+                            React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-6 mb-8" },
+                                React.createElement("div", { className: "bg-gray-50 p-4 rounded-lg shadow-sm" },
+                                    React.createElement("h2", { className: "text-xl font-semibold text-gray-700 mb-4" }, "תנאי טיסה התחלתיים"),
+                                    React.createElement("div", { className: "mb-4" },
+                                        React.createElement("label", { htmlFor: "initialAltitude", className: "block text-sm font-medium text-gray-700" }, "גובה התחלתי (רגל)"),
+                                        React.createElement("input", {
+                                            type: "number",
+                                            id: "initialAltitude",
+                                            value: initialAltitude,
+                                            onChange: (e) => setInitialAltitude(parseFloat(e.target.value) || 0),
+                                            className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2",
+                                            min: "0"
+                                        })
+                                    ),
+                                    React.createElement("div", { className: "mb-4" },
+                                        React.createElement("label", { htmlFor: "groundAltitude", className: "block text-sm font-medium text-gray-700" }, "גובה קרקע (רגל)"),
+                                        React.createElement("input", {
+                                            type: "number",
+                                            id: "groundAltitude",
+                                            value: groundAltitude,
+                                            onChange: (e) => setGroundAltitude(parseFloat(e.target.value) || 0),
+                                            className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2",
+                                            min: "0"
+                                        })
+                                    ),
+                                    React.createElement("div", { className: "mb-4" },
+                                        React.createElement("label", { htmlFor: "batteryTime", className: "block text-sm font-medium text-gray-700" }, "זמן סוללה (דקות)"),
+                                        React.createElement("input", {
+                                            type: "number",
+                                            id: "batteryTime",
+                                            value: batteryTime,
+                                            onChange: (e) => setBatteryTime(parseFloat(e.target.value) || 0),
+                                            className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2",
+                                            min: "1"
+                                        })
+                                    ),
+                                    React.createElement("div", null,
+                                        React.createElement("label", { htmlFor: "desiredFlightDirection", className: "block text-sm font-medium text-gray-700" }, "כיוון טיסה ספציפי (מעלות)"),
+                                        React.createElement("input", {
+                                            type: "number",
+                                            id: "desiredFlightDirection",
+                                            value: desiredFlightDirection,
+                                            onChange: (e) => setDesiredFlightDirection(parseFloat(e.target.value) || 0),
+                                            className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2",
+                                            min: "0",
+                                            max: "360"
+                                        })
+                                    )
+                                ),
+
+                                React.createElement("div", { className: "bg-gray-50 p-4 rounded-lg shadow-sm" },
+                                    React.createElement("h2", { className: "text-xl font-semibold text-gray-700 mb-4" }, "מהירות (IAS) מול קצב ירידה"),
+                                    React.createElement("div", { className: "scrollable-section" },
+                                        speedRoDPairs.map((pair, index) => (
+                                            React.createElement("div", { key: index, className: "flex items-end space-x-2 mb-2" },
+                                                React.createElement("div", { className: "flex-1" },
+                                                    React.createElement("label", { htmlFor: `speed-${index}`, className: "block text-xs font-medium text-gray-600" }, "מהירות (קשרים)"),
+                                                    React.createElement("input", {
+                                                        type: "number",
+                                                        id: `speed-${index}`,
+                                                        value: pair.speed,
+                                                        onChange: (e) => updateSpeedRoDPair(index, 'speed', e.target.value),
+                                                        className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2",
+                                                        min: "0"
+                                                    })
+                                                ),
+                                                React.createElement("div", { className: "flex-1" },
+                                                    React.createElement("label", { htmlFor: `rod-${index}`, className: "block text-xs font-medium text-gray-600" }, "קצב ירידה (רגל/דקה)"),
+                                                    React.createElement("input", {
+                                                        type: "number",
+                                                        id: `rod-${index}`,
+                                                        value: pair.rod,
+                                                        onChange: (e) => updateSpeedRoDPair(index, 'rod', e.target.value),
+                                                        className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2",
+                                                        min: "0"
+                                                    })
+                                                ),
+                                                React.createElement("button", {
+                                                    onClick: () => removeSpeedRoDPair(index),
+                                                    className: "p-2 bg-red-500 text-white rounded-md hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2",
+                                                    disabled: speedRoDPairs.length <= 2
+                                                },
+                                                    React.createElement("svg", { xmlns: "http://www.w3.org/2000/svg", className: "h-5 w-5", viewBox: "0 0 20 20", fill: "currentColor" },
+                                                        React.createElement("path", { fillRule: "evenodd", d: "M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1zm2 5a1 1 0 011-1h0a1 1 0 110 2h0a1 1 0 01-1-1z", clipRule: "evenodd" })
+                                                    )
+                                                )
+                                            )
+                                        ))
+                                    ),
+                                    React.createElement("button", {
+                                        onClick: addSpeedRoDPair,
+                                        className: "w-full bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 mt-4"
+                                    }, "הוסף זוג מהירות/קצב ירידה")
+                                )
+                            ),
+
+                            React.createElement("div", { className: "bg-gray-50 p-4 rounded-lg shadow-sm mb-8" },
+                                React.createElement("h2", { className: "text-xl font-semibold text-gray-700 mb-4" }, "שכבות רוח (לכל 1000 רגל גובה)"),
+                                React.createElement("div", { className: "scrollable-section" },
+                                    windLayers.map((layer, index) => (
+                                        React.createElement("div", { key: index, className: "flex items-end space-x-2 mb-2" },
+                                            React.createElement("div", { className: "flex-1" },
+                                                React.createElement("label", { htmlFor: `wind-alt-${index}`, className: "block text-xs font-medium text-gray-600" }, "גובה (אלפי רגל)"),
+                                                React.createElement("input", {
+                                                    type: "number",
+                                                    id: `wind-alt-${index}`,
+                                                    value: layer.altitudeKft,
+                                                    onChange: (e) => updateWindLayer(index, 'altitudeKft', e.target.value),
+                                                    className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2",
+                                                    min: "0"
+                                                })
+                                            ),
+                                            React.createElement("div", { className: "flex-1" },
+                                                React.createElement("label", { htmlFor: `wind-speed-${index}`, className: "block text-xs font-medium text-gray-600" }, "מהירות (קשרים)"),
+                                                React.createElement("input", {
+                                                    type: "number",
+                                                    id: `wind-speed-${index}`,
+                                                    value: layer.speed,
+                                                    onChange: (e) => updateWindLayer(index, 'speed', e.target.value),
+                                                    className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2",
+                                                    min: "0"
+                                                })
+                                            ),
+                                            React.createElement("div", { className: "flex-1" },
+                                                React.createElement("label", { htmlFor: `wind-dir-${index}`, className: "block text-xs font-medium text-gray-600" }, "כיוון (מעלות)"),
+                                                React.createElement("input", {
+                                                    type: "number",
+                                                    id: `wind-dir-${index}`,
+                                                    value: layer.direction,
+                                                    onChange: (e) => updateWindLayer(index, 'direction', e.target.value),
+                                                    className: "mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2",
+                                                    min: "0",
+                                                    max: "360"
+                                                })
+                                            ),
+                                            React.createElement("button", {
+                                                onClick: () => removeWindLayer(index),
+                                                className: "p-2 bg-red-500 text-white rounded-md hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2",
+                                                disabled: windLayers.length <= 1
+                                            },
+                                                React.createElement("svg", { xmlns: "http://www.w3.org/2000/svg", className: "h-5 w-5", viewBox: "0 0 20 20", fill: "currentColor" },
+                                                    React.createElement("path", { fillRule: "evenodd", d: "M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1zm2 5a1 1 0 011-1h0a1 1 0 110 2h0a1 1 0 01-1-1z", clipRule: "evenodd" })
+                                                )
+                                            )
+                                        )
+                                    ))
+                                ),
+                                React.createElement("button", {
+                                    onClick: addWindLayer,
+                                    className: "w-full bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 mt-4"
+                                }, "הוסף שכבת רוח")
+                            )
+                        ),
+
+                        React.createElement("button", {
+                            onClick: calculateGlideDistance,
+                            className: `w-full bg-green-600 text-white font-bold py-3 px-4 rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 transition duration-150 ease-in-out ${!isLoading ? 'button-glow' : ''}`,
+                            disabled: isLoading
+                        },
+                            isLoading ? (
+                                React.createElement("span", { className: "flex items-center justify-center" },
+                                    React.createElement("svg", { className: "animate-spin -ml-1 mr-3 h-5 w-5 text-white", xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24" },
+                                        React.createElement("circle", { className: "opacity-25", cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "4" }),
+                                        React.createElement("path", { className: "opacity-75", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" })
+                                    ),
+                                    "מחשב..."
+                                )
+                            ) : (
+                                "חשב מרחק דאייה"
+                            )
+                        ),
+
+                        specificDirectionResult && specificDirectionResult.speed !== null && (
+                            React.createElement("div", { className: "mt-8 p-6 bg-purple-50 rounded-lg shadow-inner text-center" },
+                                React.createElement("h2", { className: "text-2xl font-bold text-purple-800 mb-4" }, "תוצאות עבור כיוון שהוזן (", specificDirectionResult.direction, "\u00b0 אמת)"),
+                                React.createElement("p", { className: "text-xl text-gray-800 mb-2" },
+                                    "מהירות אופטימלית: ", React.createElement("span", { className: "font-bold text-purple-700" }, specificDirectionResult.speed.toFixed(1), " קשרים (IAS)")
+                                ),
+                                React.createElement("p", { className: "text-xl text-gray-800 mb-2" },
+                                    "מרחק טיסה: ", React.createElement("span", { className: "font-bold text-purple-700" }, specificDirectionResult.distance.toFixed(2), " קילומטרים")
+                                ),
+                                React.createElement("p", { className: "text-xl text-gray-800" },
+                                    "זמן טיסה: ", React.createElement("span", { className: "font-bold text-purple-700" }, specificDirectionResult.time.toFixed(1), " דקות")
+                                )
+                            )
+                        ),
+
+                        React.createElement("h2", { className: "text-2xl font-bold text-center text-gray-800 mt-8 mb-4" }, "מרחק דאייה לפי כיוון (גרף עכביש)"),
+                        React.createElement(SpiderGraph, { data: polarResults, desiredFlightDirection: desiredFlightDirection })
+                    )
+                )
+            );
+        };
+
+        ReactDOM.render(React.createElement(CalculatorApp, null), document.getElementById('root'));
+    </script>
+</body>
+</html>
+
